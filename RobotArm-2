@@ -24,8 +24,52 @@
 //  - FullStop() freezes rover & arm; script never auto-releases handbrake
 //
 // =============================================================
-
-
+//   Design of Arm:  Center mounted
+//  
+//
+//
+//                   .----||----.
+//                   [ Drill ]
+//                        ||
+//                        ||
+//                        ||
+//                   .----||----.
+//                   [ PISTON 4 ]
+//                        ||
+//                        ||
+//                        ||
+//                   .----||----.
+//                   [ PISTON 3 ]
+//                        ||
+//                        ||
+//                        ||
+//                .-------||-------.
+//                |   HINGE #2    |   (180° range)
+//                '---------------'
+//                        ||
+//                        ||
+//                   [ PISTON 2 ]
+//                        ||
+//                        ||
+//                        vv
+//                    .-------.
+//                    | ROTOR |    (rotational actuator)
+//                    '-------'
+//                        ||
+//                        ||
+//                .---------------.
+//                |   HINGE #1    |   (180° range)
+//                '---------------'
+//                        ||
+//                        ||
+//                   [ PISTON 1 ]
+//                        ||
+//                        ||  (Perpendicular to surface)
+//                        ||
+//  =========================================================
+//                   FLAT MOUNTING SURFACE
+//
+//
 // ======================= CONFIG =======================
 
 // --- Block names ---
@@ -82,8 +126,8 @@ const float MODE1_STEP_M          = 0.1f;   // extension increment per full swee
 
 
 // Mode 2: hill removal
-const float MODE2_LEFT_DEG        = -45f;
-const float MODE2_RIGHT_DEG       =  45f;
+const float MODE2_LEFT_DEG        = 60f;
+const float MODE2_RIGHT_DEG       =  120f;
 const float MODE2_START_MAIN_DEG  = -10f;
 const float MODE2_END_MAIN_DEG    = -70f;
 const float MODE2_STEP_MAIN_DEG   = -10f;
