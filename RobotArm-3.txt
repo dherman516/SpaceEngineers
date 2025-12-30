@@ -1,0 +1,1403 @@
+// =============================================================
+//  RoverAutoExcavation_Rewrite.cs  (Dave build, cleaned + updated)
+// =============================================================
+//
+//  Commands:
+//    mode1                - Ground sweep, one full depth pattern
+//    mode1 repeat         - Continuous ground sweep (looping)
+//    mode1 torque         - (torque ignored now, kept for compatibility)
+//    mode1 repeat torque  - (same)
+//
+//    mode2                - Hill removal pass
+//    mode2 torque         - (torque ignored)
+//
+//    mode3                - GPS-target drilling on nearest "#GPS:...:DrillPoint:"
+//    mode3 torque         - (torque ignored)
+//
+//    move a b c p1 p2 p3  - Manual pose: mainDeg tipDeg rotorDeg ext third final
+//    home                 - Go to home pose (folded, retracted)
+//    stop                 - Kill switch; stops everything and brakes
+//    test                 - Unit test poses sequence (fast motion)
+//
+//  Notes:
+//  - All three arm pistons are treated as 2.0 m max extension.
+//  - FullStop() never releases handbrake.
+//  - Torque detection is disabled (commands still parse "torque" but it does nothing).
+//  - Cargo + drill fullness combined for “no more material” detection.
+//  - Suspension is lowered at start of any mode and reset on abort/idle.
+//
+// =============================================================
+
+
+// ======================= CONFIG =======================
+
+// --- Block names ---
+const string ROTOR_NAME        = "Drill-Rotor";
+
+const string PISTON_EXT_NAME   = "Drill-Piston-Upper";   // between hinge first and hinge second
+const string PISTON_THIRD_NAME = "Drill-Piston-Third";   // between hinge second and final piston
+const string PISTON_FINAL_NAME = "Drill-Piston-Final";   // closest to drill
+
+const string HINGE_MAIN_NAME   = "Drill-Hinge-First";    // between rotor and upper piston
+const string HINGE_TIP_NAME    = "Drill-Hinge-Second";   // between upper piston and third piston
+
+const string DRILL_NAME        = "Drill";
+
+// Cargo – leave empty to sum all cargo on grid
+const string CARGO_NAME        = "";
+
+// Suspension (no longer using thrusters/gyros)
+const string DOWN_THRUSTER_TAG = "[Downforce]"; // kept but unused now
+
+// Debug buffer
+string debug = "";
+void DBG(string s) { debug += s + "\n"; }
+
+// Last abort reason (for logging)
+string lastAbortReason = "";
+
+// --- Basic arm geometry assumptions ---
+const float  ANGLE_TOL_DEG       = 1.0f;
+const double POS_TOL_M           = 0.01;
+
+// Safe zone: main hinge must not go “behind” this angle
+const float SAFE_MAIN_HINGE_MIN_DEG = -10f;
+
+// Home pose
+const float HINGE_MAIN_HOME_DEG  = 90f;
+const float HINGE_TIP_HOME_DEG   = 0f;
+const float ROTOR_HOME_DEG       = 0f;
+
+const double EXT_PISTON_HOME_POS_M   = 0.0;
+const double THIRD_PISTON_HOME_POS_M = 0.0;
+const double FINAL_PISTON_HOME_POS_M = 0.0;
+
+// All pistons treated as 2m for logic
+const double EXT_PISTON_WORK_POS_M   = 2.0;
+const double THIRD_PISTON_WORK_POS_M = 2.0;
+const double FINAL_PISTON_WORK_POS_M = 2.0;
+
+
+// ======================= MODE CONFIG =======================
+
+// Mode 1 geometry and step config (matches your build)
+const float MODE1_HINGE_MAIN_DEG   = 90f;   // arm fully forward/down
+const float MODE1_HINGE_TIP_DEG    = -60f;  // drill safely down
+
+// NOTE: simplified Mode1 behavior:
+// - Pistons start at 0
+// - Sweep immediately
+// - After each full sweep (left->right->left), increase total length by 0.2m
+// - Third fills first, then Final
+const double MODE1_START_EXT_M     = 0.0;   // combined third+final start
+const double MODE1_STEP_EXT_M      = 0.2;   // increase total length by 0.2 m per full sweep
+const double MODE1_MAX_EXT_M       = 4.0;   // safety cap for total (third + final)
+
+// Rotor sweep range for Mode1
+const float MODE1_LEFT_DEG         = 60f;
+const float MODE1_RIGHT_DEG        = -60f;
+const float MODE1_SWEEP_RPM        = 1.0f;  // base RPM for Mode1 (adjust as needed)
+
+// Mode 2: hill removal (kept as originally configured)
+const float MODE2_LEFT_DEG        = 60f;
+const float MODE2_RIGHT_DEG       = 120f;
+const float MODE2_START_MAIN_DEG  = -10f;
+const float MODE2_END_MAIN_DEG    = -70f;
+const float MODE2_STEP_MAIN_DEG   = -10f;
+const float MODE2_HINGE_TIP_DEG   =  0f;
+const float MODE2_SWEEP_RPM       = 0.35f;
+
+
+// Torque-based “touch ground” detection (DISABLED)
+// Left here so old commands still parse, but logic removed
+const float TOUCH_TORQUE_THRESHOLD = 30f;
+const float TOUCH_ANGLE_EPS_DEG    = 0.2f;
+const float TOUCH_CHECK_TIME_S     = 0.5f;
+
+
+// Cargo + drill “no more material” detection
+const double FULLNESS_DELTA_EPS      = 0.0005;
+const double FULLNESS_STABLE_TIME_S  = 10.0;
+const double FULL_THRESHOLD          = 0.99;
+
+
+// Status timing
+const double STATUS_INTERVAL_S       = 0.5;
+
+
+// Mode 3 targeting (GPS)
+Vector3D? mode3Target = null;
+
+
+// ======================= INTERNAL STATE =======================
+
+// Arm blocks
+IMyMotorStator rotor;
+IMyPistonBase pistonExt;
+IMyPistonBase pistonThird;
+IMyPistonBase pistonFinal;
+IMyMotorStator hingeMain;
+IMyMotorStator hingeTip;
+IMyShipDrill drill;
+
+// Rover systems
+List<IMyCargoContainer> cargos = new List<IMyCargoContainer>();
+List<IMyMotorSuspension> wheels = new List<IMyMotorSuspension>();
+IMyShipController ctrl;
+
+IMyTextSurface lcd;
+
+// Manual Move
+float manualMainRad  = 0f;
+float manualTipRad   = 0f;
+float manualRotorRad = 0f;
+float manualPExt     = 0f;
+float manualPThird   = 0f;
+float manualPFinal   = 0f;
+
+// Modes / states
+enum GlobalMode {
+    None,
+    Mode1,
+    Mode2,
+    Mode3,
+    Move
+}
+
+enum ArmState {
+    Idle,
+    Homing,
+    ManualMove,
+
+    // Mode 1
+    Mode1_Init,
+    Mode1_Sweep,
+    Mode1_Return,
+
+    // Mode 2
+    Mode2_Init,
+    Mode2_Lower,
+    Mode2_Sweep,
+    Mode2_RaiseAngle,
+    Mode2_CheckStopAngle,
+    Mode2_Return,
+
+    // Mode 3
+    Mode3_FindTarget,
+    Mode3_MoveArm,
+    Mode3_Drill,
+    Mode3_Return
+}
+
+enum TestPose {
+    None,
+    VerticalHome,
+    RotorLeft,
+    RotorRight,
+    Folded,
+    ExtendedForward,
+    PistonExt,
+    PistonThird,
+    PistonFinal,
+    FullExtension,
+    Done
+}
+
+enum Mode1EndAction { Stop, Repeat }
+
+GlobalMode currentMode = GlobalMode.None;
+ArmState state = ArmState.Idle;
+TestPose testPose = TestPose.None;
+Mode1EndAction mode1EndAction = Mode1EndAction.Stop;
+
+bool IsTestMode() => testPose != TestPose.None;
+
+
+// Shared
+double lastStatusTime = 0;
+bool stopRequested = false;
+bool torqueEnabled = false;        // Parsed but not used anymore
+bool drillEnabledForMode = true;
+
+// Mode 1 internal
+bool mode1SweepDirPositive = true;
+float mode1TargetRotorRad = 0f;
+double mode1LastFullness = 0.0;
+double mode1FullnessStableTime = 0.0;
+// Mode 1 progression: total combined extension (third + final)
+double mode1CurrentExt = MODE1_START_EXT_M;
+bool mode1PassedRight = false;     // For full-sweep detection
+
+// Mode 2 internal
+float mode2CurrentMainDeg = MODE2_START_MAIN_DEG;
+bool mode2SweepDirPositive = true;
+float mode2TargetRotorRad = 0f;
+double mode2LastFullness = 0.0;
+double mode2FullnessStableTime = 0.0;
+
+// Torque timing (no longer used for detection, but kept for compatibility in Mode3)
+double touchCheckTimer = 0.0;
+float lastHingeMainAngle = 0f;
+
+
+// ======================= SUSPENSION CONTROL =======================
+
+void FindWheels()
+{
+    wheels.Clear();
+    GridTerminalSystem.GetBlocksOfType(wheels, w => w.CubeGrid == Me.CubeGrid);
+}
+
+// Normal driving settings
+void ResetWheels()
+{
+    foreach (var w in wheels)
+    {
+        w.Strength = 50f;    // normal stiffness
+        w.Height   = 0.0f;   // default ride height
+        w.Power    = 1.0f;
+        w.Friction = 1.0f;
+        w.Brake    = false;
+    }
+}
+
+// Drilling / arm movement settings
+void LowerCenterOfGravity()
+{
+    foreach (var w in wheels)
+    {
+        w.Strength = 100f;   // stiff suspension -> chassis pushed down
+        w.Height   = -0.2f;  // slightly lower ride height
+        w.Power    = 1.0f;
+        w.Friction = 1.5f;   // more grip
+    }
+}
+
+
+// ======================= PROGRAM =======================
+
+public Program() {
+    Runtime.UpdateFrequency = UpdateFrequency.Update10;
+
+    lcd = Me.GetSurface(0);
+    lcd.ContentType = VRage.Game.GUI.TextPanel.ContentType.TEXT_AND_IMAGE;
+    lcd.FontSize = 1.0f;
+    lcd.Font = "Monospace";
+
+    Echo("PreInit...");
+    FindBlocks(true);
+    FindWheels();
+    ResetWheels();
+    Echo("Init...");
+}
+
+public void Save() { }
+
+public void Main(string argument, UpdateType updateSource) {
+
+    if (!string.IsNullOrWhiteSpace(argument)) {
+        HandleCommand(argument.Trim().ToLower());
+    }
+
+    if (!EnsureBlocks()) {
+        Abort("ERROR: Missing required blocks. Check names & grid.");
+        UpdateStatus(0.016);
+        return;
+    }
+
+    double dt = Runtime.TimeSinceLastRun.TotalSeconds;
+    if (dt <= 0) dt = 0.016;
+
+    // Safe zone check every tick
+    CheckSafeZone();
+
+    if (!stopRequested) {
+        UpdateStateMachine(dt);
+    }
+
+    UpdateStatus(dt);
+}
+
+
+// ======================= ABORT / FULL STOP =======================
+
+void Abort(string reason)
+{
+    lastAbortReason = reason;
+    DBG("ABORT: " + reason);
+    FullStop();
+    ResetWheels();
+    stopRequested = true;
+    currentMode = GlobalMode.None;
+    state = ArmState.Idle;
+}
+
+void FullStop() {
+
+    // Stop arm motion
+    if (rotor != null) rotor.TargetVelocityRPM = 0f;
+    if (hingeMain != null) hingeMain.TargetVelocityRPM = 0f;
+    if (hingeTip  != null) hingeTip.TargetVelocityRPM  = 0f;
+
+    if (pistonExt   != null) pistonExt.Velocity   = 0f;
+    if (pistonThird != null) pistonThird.Velocity = 0f;
+    if (pistonFinal != null) pistonFinal.Velocity = 0f;
+
+    // Stop drill
+    if (drill != null) drill.Enabled = false;
+
+    // Stop wheels and apply wheel-level brake
+    foreach (var w in wheels) {
+        w.PropulsionOverride = 0f;
+        w.Brake = true;
+    }
+
+    // Engage cockpit handbrake
+    if (ctrl != null)
+        ctrl.HandBrake = true;
+}
+
+
+// ======================= COMMANDS =======================
+
+void HandleCommand(string arg) {
+    Echo("Command: " + arg);
+
+    // Any new command clears STOP
+    stopRequested = false;
+    lastAbortReason = "";
+
+    // MOVE
+    // move <mainDeg> <tipDeg> <rotorDeg> <pExt> <pThird> <pFinal>
+    if (arg.StartsWith("move ")) {
+        if (EnsureBlocks()) {
+            FullStop();
+            ResetWheels();
+            LowerCenterOfGravity();
+            ParseManualMoveCommand(arg);
+            currentMode = GlobalMode.Move;
+            state = ArmState.ManualMove;
+        }
+        return;
+    }
+
+    // MODE 1
+    if (arg.StartsWith("mode1")) {
+        if (EnsureBlocks()) {
+
+            torqueEnabled       = arg.Contains("torque");  // parsed but unused
+            drillEnabledForMode = !arg.Contains("nodrill");
+
+            if (arg.Contains("repeat"))
+                mode1EndAction = Mode1EndAction.Repeat;
+            else
+                mode1EndAction = Mode1EndAction.Stop;
+
+            currentMode = GlobalMode.Mode1;
+            FullStop();
+            ResetWheels();
+            LowerCenterOfGravity();
+            state = ArmState.Homing;
+        }
+        return;
+    }
+
+    // MODE 2
+    if (arg.StartsWith("mode2")) {
+        if (EnsureBlocks()) {
+
+            torqueEnabled       = arg.Contains("torque"); // parsed but unused
+            drillEnabledForMode = !arg.Contains("nodrill");
+
+            currentMode = GlobalMode.Mode2;
+            mode2CurrentMainDeg = MODE2_START_MAIN_DEG;
+            FullStop();
+            ResetWheels();
+            LowerCenterOfGravity();
+            state = ArmState.Homing;
+        }
+        return;
+    }
+
+    // MODE 3
+    if (arg.StartsWith("mode3")) {
+        if (EnsureBlocks()) {
+
+            torqueEnabled       = arg.Contains("torque"); // parsed but unused
+            drillEnabledForMode = !arg.Contains("nodrill");
+
+            currentMode = GlobalMode.Mode3;
+            FullStop();
+            ResetWheels();
+            LowerCenterOfGravity();
+            state = ArmState.Homing;
+        }
+        return;
+    }
+
+    // HOME
+    if (arg == "home") {
+        FullStop();
+        currentMode = GlobalMode.None;
+        ResetWheels();
+        LowerCenterOfGravity();
+        state = ArmState.Homing;
+        return;
+    }
+
+    // STOP
+    if (arg == "stop") {
+        Abort("STOP command");
+        return;
+    }
+
+    // TEST (unit poses)
+    if (arg == "test") {
+        FullStop();
+        ResetWheels();
+        LowerCenterOfGravity();
+        testPose = TestPose.VerticalHome;
+        AdvanceTestPose();   // kick off first pose
+        return;
+    }
+
+    Echo("Unknown command");
+}
+
+
+// ======================= SAFE ZONE =======================
+
+void CheckSafeZone()
+{
+    if (hingeMain == null) return;
+
+    if (hingeMain.Angle < DegToRad(SAFE_MAIN_HINGE_MIN_DEG))
+    {
+        Abort("SAFE ZONE VIOLATION: Main hinge too far back!");
+    }
+}
+
+
+// ======================= STATE MACHINE =======================
+
+void UpdateStateMachine(double dt) {
+    switch (state) {
+
+        case ArmState.Idle:
+            break;
+
+        case ArmState.Homing:
+            HomingState();
+            break;
+
+        case ArmState.ManualMove:
+            ManualMoveState();
+            break;
+
+        // Mode 1
+        case ArmState.Mode1_Init:
+            Mode1_Init();
+            break;
+
+        case ArmState.Mode1_Sweep:
+            Mode1_Sweep(dt);
+            break;
+
+        case ArmState.Mode1_Return:
+            Mode1_Return();
+            break;
+
+        // Mode 2
+        case ArmState.Mode2_Init:
+            Mode2_Init();
+            break;
+
+        case ArmState.Mode2_Lower:
+            Mode2_Lower(dt);
+            break;
+
+        case ArmState.Mode2_Sweep:
+            Mode2_Sweep(dt);
+            break;
+
+        case ArmState.Mode2_RaiseAngle:
+            Mode2_RaiseAngle();
+            break;
+
+        case ArmState.Mode2_CheckStopAngle:
+            Mode2_CheckStopAngle();
+            break;
+
+        case ArmState.Mode2_Return:
+            Mode2_Return();
+            break;
+
+        // Mode 3
+        case ArmState.Mode3_FindTarget:
+            Mode3_FindTarget();
+            break;
+
+        case ArmState.Mode3_MoveArm:
+            Mode3_MoveArm(dt);
+            break;
+
+        case ArmState.Mode3_Drill:
+            Mode3_Drill(dt);
+            break;
+
+        case ArmState.Mode3_Return:
+            Mode3_Return();
+            break;
+    }
+}
+
+
+// ======================= HOMING & MANUAL =======================
+
+void HomingState() {
+    bool rHome      = MoveRotorToAngle(rotor, DegToRad(ROTOR_HOME_DEG));
+    bool pFinalHome = MovePistonTo(pistonFinal, (float)FINAL_PISTON_HOME_POS_M, false);
+    bool pThirdHome = MovePistonTo(pistonThird, (float)THIRD_PISTON_HOME_POS_M, false);
+    bool pExtHome   = MovePistonTo(pistonExt,   (float)EXT_PISTON_HOME_POS_M,   false);
+    bool hTipHome   = MoveHingeToAngle(hingeTip,   DegToRad(HINGE_TIP_HOME_DEG));
+    bool hMainHome  = MoveHingeToAngle(hingeMain, DegToRad(HINGE_MAIN_HOME_DEG));
+
+    drill.Enabled = false;
+
+    if (rHome && pFinalHome && pThirdHome && pExtHome && hTipHome && hMainHome) {
+
+        switch (currentMode) {
+            case GlobalMode.Mode1:
+                PrepareMode1();
+                break;
+
+            case GlobalMode.Mode2:
+                PrepareMode2();
+                break;
+
+            case GlobalMode.Mode3:
+                state = ArmState.Mode3_FindTarget;
+                break;
+
+            default:
+                ResetWheels();
+                state = ArmState.Idle;
+                break;
+        }
+    }
+}
+
+void ManualMoveState()
+{
+    DBG("=== ManualMoveState ===");
+
+    bool hMain  = MoveHingeToAngle(hingeMain, manualMainRad);
+    bool hTip   = MoveHingeToAngle(hingeTip,  manualTipRad);
+    bool rDone  = MoveRotorToAngle(rotor, manualRotorRad, 0.5f);
+
+    bool pExt   = MovePistonTo(pistonExt,   manualPExt,   false);
+    bool pThird = MovePistonTo(pistonThird, manualPThird, false);
+    bool pFinal = MovePistonTo(pistonFinal, manualPFinal, false);
+
+    if (hMain && hTip && rDone && pExt && pThird && pFinal)
+    {
+        FullStop();
+        ResetWheels();
+        state = ArmState.Idle;
+
+        if (testPose != TestPose.None)
+            AdvanceTestPose();
+    }
+}
+
+
+// ======================= MODE 1 (GROUND SWEEP, SIMPLIFIED) =======================
+
+void PrepareMode1() {
+    // Initialize Mode1 internal state
+    mode1SweepDirPositive = true;
+    mode1TargetRotorRad   = DegToRad(MODE1_LEFT_DEG);
+
+    mode1LastFullness        = GetTotalFullness();
+    mode1FullnessStableTime  = 0.0;
+
+    touchCheckTimer   = 0.0;
+    lastHingeMainAngle = hingeMain != null ? hingeMain.Angle : 0f;
+
+    // Start with combined extension at 0
+    mode1CurrentExt = MODE1_START_EXT_M;
+    mode1PassedRight = false;
+
+    state = ArmState.Mode1_Init;
+}
+
+void Mode1_Init() {
+    // Move to working pose:
+    bool rLeft     = MoveRotorToAngle(rotor, DegToRad(MODE1_LEFT_DEG));
+
+    bool pExtPos   = MovePistonTo(pistonExt,   0.0f,   false);
+    bool pThirdPos = MovePistonTo(pistonThird, 0.0f,   false);
+    bool pFinalPos = MovePistonTo(pistonFinal, 0.0f,   false);
+    bool hMainPos  = MoveHingeToAngle(hingeMain, DegToRad(MODE1_HINGE_MAIN_DEG));
+    bool hTipPos   = MoveHingeToAngle(hingeTip,   DegToRad(MODE1_HINGE_TIP_DEG));
+
+    drill.Enabled = false;
+
+    if (rLeft && pExtPos && pThirdPos && pFinalPos && hMainPos && hTipPos) {
+        // Ready to sweep with pistons at 0
+        mode1TargetRotorRad  = DegToRad(MODE1_RIGHT_DEG);
+        mode1SweepDirPositive = true;
+        mode1LastFullness   = GetTotalFullness();
+        mode1FullnessStableTime = 0.0;
+        mode1PassedRight    = false;
+
+        drill.Enabled = drillEnabledForMode;
+        state = ArmState.Mode1_Sweep;
+    }
+}
+
+void Mode1_Sweep(double dt) {
+    double fullness = GetTotalFullness();
+
+    if (fullness >= FULL_THRESHOLD) {
+        drill.Enabled = false;
+        state = ArmState.Mode1_Return;
+        return;
+    }
+
+    // Maintain posture
+    MoveHingeToAngle(hingeMain, DegToRad(MODE1_HINGE_MAIN_DEG));
+    MoveHingeToAngle(hingeTip,   DegToRad(MODE1_HINGE_TIP_DEG));
+    MovePistonTo(pistonExt, (float)EXT_PISTON_WORK_POS_M, false);
+
+    // Adjust Third+Final for current total extension
+    SetMode1Extension(mode1CurrentExt);
+
+    // Rotor sweep control with deadband
+    const float ANGLE_DEADBAND_RAD = 0.02f; // ~1.1 deg
+
+    float current = rotor != null ? rotor.Angle : 0f;
+    float diff = mode1TargetRotorRad - current;
+
+    if (Math.Abs(diff) <= ANGLE_DEADBAND_RAD)
+    {
+        rotor.TargetVelocityRPM = 0f;
+
+        float currentDeg = RadToDeg(current);
+
+        // Mark passing right limit
+        if (Math.Abs(currentDeg - MODE1_RIGHT_DEG) < 3.0f)
+            mode1PassedRight = true;
+
+        // Full sweep when we hit LEFT after having passed RIGHT
+        if (Math.Abs(currentDeg - MODE1_LEFT_DEG) < 3.0f && mode1PassedRight)
+        {
+            mode1PassedRight = false;
+            // Increase combined extension by 0.2m
+            mode1CurrentExt += MODE1_STEP_EXT_M;
+            if (mode1CurrentExt > MODE1_MAX_EXT_M)
+            {
+                // Reached max extension – return home
+                drill.Enabled = false;
+                state = ArmState.Mode1_Return;
+                return;
+            }
+        }
+
+        // Flip direction
+        mode1SweepDirPositive = !mode1SweepDirPositive;
+        mode1TargetRotorRad = DegToRad(mode1SweepDirPositive ? MODE1_RIGHT_DEG : MODE1_LEFT_DEG);
+    }
+    else
+    {
+        float baseRpm = IsTestMode() ? 2.0f : MODE1_SWEEP_RPM;
+        float speed = baseRpm;
+
+        // Slow down near target to avoid overshoot
+        if (Math.Abs(diff) < DegToRad(10f))
+            speed = Math.Max(0.5f, baseRpm * 0.5f);
+
+        rotor.TargetVelocityRPM = diff > 0 ? speed : -speed;
+    }
+
+    drill.Enabled = drillEnabledForMode;
+
+    // Cargo + drill fullness detection
+    double combined = fullness;
+    double delta = combined - mode1LastFullness;
+
+    if (delta > FULLNESS_DELTA_EPS) {
+        mode1LastFullness = combined;
+        mode1FullnessStableTime = 0.0;
+    }
+    else {
+        mode1FullnessStableTime += dt;
+
+        if (mode1FullnessStableTime >= FULLNESS_STABLE_TIME_S) {
+            drill.Enabled = false;
+            state = ArmState.Mode1_Return;
+        }
+    }
+}
+
+// Distribute combined extension between Third and Final pistons
+void SetMode1Extension(double totalExt)
+{
+    totalExt = Math.Max(0.0, Math.Min(MODE1_MAX_EXT_M, totalExt));
+
+    double thirdTarget = Math.Min(totalExt, THIRD_PISTON_WORK_POS_M);
+    double finalTarget = Math.Max(0.0, totalExt - thirdTarget);
+    finalTarget = Math.Min(finalTarget, FINAL_PISTON_WORK_POS_M);
+
+    MovePistonTo(pistonThird, (float)thirdTarget, false);
+    MovePistonTo(pistonFinal, (float)finalTarget, false);
+}
+
+void Mode1_Return() {
+    bool rHome      = MoveRotorToAngle(rotor, DegToRad(ROTOR_HOME_DEG));
+    bool pFinalHome = MovePistonTo(pistonFinal, (float)FINAL_PISTON_HOME_POS_M, false);
+    bool pThirdHome = MovePistonTo(pistonThird, (float)THIRD_PISTON_HOME_POS_M, false);
+    bool pExtHome   = MovePistonTo(pistonExt,   (float)EXT_PISTON_HOME_POS_M,   false);
+    bool hTipHome   = MoveHingeToAngle(hingeTip,   DegToRad(HINGE_TIP_HOME_DEG));
+    bool hMainHome  = MoveHingeToAngle(hingeMain, DegToRad(HINGE_MAIN_HOME_DEG));
+    
+    drill.Enabled = false;
+
+    if (rHome && pFinalHome && pThirdHome && pExtHome && hTipHome && hMainHome) {
+        FullStop();
+        ResetWheels();
+
+        switch (mode1EndAction) {
+            case Mode1EndAction.Stop:
+                state = ArmState.Idle;
+                currentMode = GlobalMode.None;
+                break;
+
+            case Mode1EndAction.Repeat:
+                LowerCenterOfGravity();
+                PrepareMode1();
+                break;
+        }
+    }
+}
+
+
+// ======================= MODE 2 (HILL REMOVAL) =======================
+
+void PrepareMode2() {
+    mode2SweepDirPositive = true;
+    mode2TargetRotorRad = DegToRad(MODE2_LEFT_DEG);
+
+    mode2LastFullness       = GetTotalFullness();
+    mode2FullnessStableTime = 0.0;
+
+    touchCheckTimer = 0.0;
+    lastHingeMainAngle = hingeMain != null ? hingeMain.Angle : 0f;
+
+    state = ArmState.Mode2_Init;
+}
+
+void Mode2_Init() {
+    bool rLeft     = MoveRotorToAngle(rotor, DegToRad(MODE2_LEFT_DEG));
+
+    bool pExtPos   = MovePistonTo(pistonExt,   (float)EXT_PISTON_WORK_POS_M,   false);
+    bool pThirdPos = MovePistonTo(pistonThird, (float)THIRD_PISTON_HOME_POS_M, false);
+    bool pFinalPos = MovePistonTo(pistonFinal, (float)FINAL_PISTON_HOME_POS_M, false);
+    bool hMainPos  = MoveHingeToAngle(hingeMain, DegToRad(mode2CurrentMainDeg));
+    bool hTipPos   = MoveHingeToAngle(hingeTip,   DegToRad(MODE2_HINGE_TIP_DEG));
+
+    drill.Enabled = false;
+
+    if (rLeft && pExtPos && pThirdPos && pFinalPos && hMainPos && hTipPos) {
+        touchCheckTimer = 0.0;
+        lastHingeMainAngle = hingeMain.Angle;
+        state = ArmState.Mode2_Lower;
+    }
+}
+
+void Mode2_Lower(double dt) {
+    if (hingeMain == null || pistonThird == null || pistonFinal == null) {
+        Abort("Mode2_Lower: missing hinge or pistons");
+        return;
+    }
+
+    bool thirdAtWork =
+        pistonThird.CurrentPosition >= THIRD_PISTON_WORK_POS_M - POS_TOL_M;
+    bool finalAtWork =
+        pistonFinal.CurrentPosition >= FINAL_PISTON_WORK_POS_M - POS_TOL_M;
+
+    if (!thirdAtWork) {
+        MovePistonTo(pistonThird, (float)THIRD_PISTON_WORK_POS_M, false);
+    }
+    else if (!finalAtWork) {
+        MovePistonTo(pistonFinal, (float)FINAL_PISTON_WORK_POS_M, false);
+    }
+
+    // Start sweep when both pistons are at depth
+    if (thirdAtWork && finalAtWork) {
+        pistonThird.Velocity = 0f;
+        pistonFinal.Velocity = 0f;
+
+        drill.Enabled = drillEnabledForMode;
+
+        mode2TargetRotorRad = DegToRad(MODE2_RIGHT_DEG);
+        mode2SweepDirPositive = true;
+
+        mode2LastFullness = GetTotalFullness();
+        mode2FullnessStableTime = 0.0;
+
+        state = ArmState.Mode2_Sweep;
+    }
+}
+
+void Mode2_Sweep(double dt) {
+    double fullness = GetTotalFullness();
+
+    if (fullness >= FULL_THRESHOLD) {
+        drill.Enabled = false;
+        state = ArmState.Mode2_Return;
+        return;
+    }
+
+    bool atTarget = MoveRotorToAngle(rotor, mode2TargetRotorRad, MODE2_SWEEP_RPM);
+
+    if (atTarget) {
+        mode2SweepDirPositive = !mode2SweepDirPositive;
+        mode2TargetRotorRad = DegToRad(
+            mode2SweepDirPositive ? MODE2_RIGHT_DEG : MODE2_LEFT_DEG
+        );
+
+        if (!mode2SweepDirPositive) {
+            state = ArmState.Mode2_RaiseAngle;
+            return;
+        }
+    }
+
+    // Maintain posture
+    MoveHingeToAngle(hingeMain, DegToRad(mode2CurrentMainDeg));
+    MoveHingeToAngle(hingeTip,   DegToRad(MODE2_HINGE_TIP_DEG));
+    MovePistonTo(pistonExt,   (float)EXT_PISTON_WORK_POS_M,   false);
+
+    drill.Enabled = drillEnabledForMode;
+
+    double combined = fullness;
+    double delta = combined - mode2LastFullness;
+
+    if (delta > FULLNESS_DELTA_EPS) {
+        mode2LastFullness = combined;
+        mode2FullnessStableTime = 0.0;
+    }
+    else {
+        mode2FullnessStableTime += dt;
+
+        if (mode2FullnessStableTime >= FULLNESS_STABLE_TIME_S) {
+            drill.Enabled = false;
+            state = ArmState.Mode2_Return;
+        }
+    }
+}
+
+void Mode2_RaiseAngle() {
+    mode2CurrentMainDeg += MODE2_STEP_MAIN_DEG;
+
+    if (mode2CurrentMainDeg < MODE2_END_MAIN_DEG)
+        mode2CurrentMainDeg = MODE2_END_MAIN_DEG;
+
+    state = ArmState.Mode2_CheckStopAngle;
+}
+
+void Mode2_CheckStopAngle() {
+    if (mode2CurrentMainDeg <= MODE2_END_MAIN_DEG) {
+        drill.Enabled = false;
+        state = ArmState.Mode2_Return;
+    }
+    else {
+        state = ArmState.Mode2_Init;
+    }
+}
+
+void Mode2_Return() {
+    bool rHome      = MoveRotorToAngle(rotor, DegToRad(ROTOR_HOME_DEG));
+    bool pFinalHome = MovePistonTo(pistonFinal, (float)FINAL_PISTON_HOME_POS_M, false);
+    bool pThirdHome = MovePistonTo(pistonThird, (float)THIRD_PISTON_HOME_POS_M, false);
+    bool pExtHome   = MovePistonTo(pistonExt,   (float)EXT_PISTON_HOME_POS_M,   false);
+    bool hTipHome   = MoveHingeToAngle(hingeTip,   DegToRad(HINGE_TIP_HOME_DEG));
+    bool hMainHome  = MoveHingeToAngle(hingeMain, DegToRad(HINGE_MAIN_HOME_DEG));
+    
+    drill.Enabled = false;
+
+    if (rHome && pFinalHome && pThirdHome && pExtHome && hTipHome && hMainHome) {
+        FullStop();
+        ResetWheels();
+        currentMode = GlobalMode.None;
+        state = ArmState.Idle;
+    }
+}
+
+
+// ======================= MODE 3 (GPS TARGET) =======================
+
+Vector3D? Mode3_FindNearestGPS() {
+    string data = Me.CustomData;
+    if (string.IsNullOrWhiteSpace(data))
+        return null;
+
+    Vector3D roverPos = ctrl.GetPosition();
+    Vector3D? best = null;
+    double bestDist = double.MaxValue;
+
+    var lines = data.Split('\n');
+    foreach (var line in lines) {
+        if (!line.StartsWith("#GPS:")) continue;
+        if (!line.Contains("DrillPoint")) continue;
+
+        var parts = line.Split(':');
+        if (parts.Length < 6) continue;
+
+        double x, y, z;
+        if (!double.TryParse(parts[2], out x)) continue;
+        if (!double.TryParse(parts[3], out y)) continue;
+        if (!double.TryParse(parts[4], out z)) continue;
+
+        Vector3D pos = new Vector3D(x, y, z);
+        double dist = Vector3D.Distance(roverPos, pos);
+
+        if (dist < bestDist) {
+            bestDist = dist;
+            best = pos;
+        }
+    }
+
+    return best;
+}
+
+void Mode3_FindTarget() {
+    mode3Target = Mode3_FindNearestGPS();
+    if (mode3Target == null) {
+        Abort("Mode3: No DrillPoint GPS found in CustomData");
+        return;
+    }
+
+    Vector3D roverPos = ctrl.GetPosition();
+    Vector3D toTarget = mode3Target.Value - roverPos;
+
+    float rotorTarget = (float)Math.Atan2(toTarget.X, toTarget.Z);
+
+    double horizDist = Math.Sqrt(toTarget.X * toTarget.X + toTarget.Z * toTarget.Z);
+    float mainTarget = -(float)Math.Atan2(toTarget.Y, horizDist);
+    float tipTarget  = 0f;  // simple approach
+
+    // crude distribution of reach to pistons
+    float extTarget   = (float)Math.Min(horizDist * 0.4, EXT_PISTON_WORK_POS_M);
+    float thirdTarget = (float)Math.Min(horizDist * 0.3, THIRD_PISTON_WORK_POS_M);
+    float finalTarget = (float)Math.Min(horizDist * 0.3, FINAL_PISTON_WORK_POS_M);
+
+    manualRotorRad = rotorTarget;
+    manualMainRad  = mainTarget;
+    manualTipRad   = tipTarget;
+    manualPExt     = extTarget;
+    manualPThird   = thirdTarget;
+    manualPFinal   = finalTarget;
+
+    state = ArmState.Mode3_MoveArm;
+}
+
+void Mode3_MoveArm(double dt) {
+    bool r  = MoveRotorToAngle(rotor, manualRotorRad);
+    bool h1 = MoveHingeToAngle(hingeMain, manualMainRad);
+    bool h2 = MoveHingeToAngle(hingeTip,  manualTipRad);
+
+    bool pExt   = MovePistonTo(pistonExt,   manualPExt,   false);
+    bool pThird = MovePistonTo(pistonThird, manualPThird, false);
+    bool pFinal = MovePistonTo(pistonFinal, manualPFinal, false);
+
+    if (r && h1 && h2 && pExt && pThird && pFinal) {
+        // Now lower for drilling
+        touchCheckTimer = 0.0;
+        lastHingeMainAngle = hingeMain.Angle;
+
+        state = ArmState.Mode3_Drill;
+    }
+}
+
+void Mode3_Drill(double dt) {
+    // Lower third then final to full work position
+    bool thirdAtWork =
+        pistonThird.CurrentPosition >= THIRD_PISTON_WORK_POS_M - POS_TOL_M;
+    bool finalAtWork =
+        pistonFinal.CurrentPosition >= FINAL_PISTON_WORK_POS_M - POS_TOL_M;
+
+    if (!thirdAtWork) {
+        MovePistonTo(pistonThird, (float)THIRD_PISTON_WORK_POS_M, false);
+    } else if (!finalAtWork) {
+        MovePistonTo(pistonFinal, (float)FINAL_PISTON_WORK_POS_M, false);
+    }
+
+    // Once fully extended, just drill until fullness stopping
+    if (thirdAtWork && finalAtWork) {
+        pistonThird.Velocity = 0f;
+        pistonFinal.Velocity = 0f;
+
+        drill.Enabled = drillEnabledForMode;
+
+        mode1LastFullness = GetTotalFullness();
+        mode1FullnessStableTime = 0.0;
+
+        state = ArmState.Mode3_Return;
+    }
+}
+
+void Mode3_Return() {
+    double fullness = GetTotalFullness();
+
+    if (fullness >= FULL_THRESHOLD) {
+        drill.Enabled = false;
+    } else {
+        double delta = fullness - mode1LastFullness;
+
+        if (delta > FULLNESS_DELTA_EPS) {
+            mode1LastFullness = fullness;
+            mode1FullnessStableTime = 0.0;
+        } else {
+            mode1FullnessStableTime += Runtime.TimeSinceLastRun.TotalSeconds;
+
+            if (mode1FullnessStableTime >= FULLNESS_STABLE_TIME_S) {
+                drill.Enabled = false;
+            }
+        }
+    }
+
+    if (drill.Enabled)
+        return;
+
+    bool rHome      = MoveRotorToAngle(rotor, DegToRad(ROTOR_HOME_DEG));
+    bool pFinalHome = MovePistonTo(pistonFinal, (float)FINAL_PISTON_HOME_POS_M, false);
+    bool pThirdHome = MovePistonTo(pistonThird, (float)THIRD_PISTON_HOME_POS_M, false);
+    bool pExtHome   = MovePistonTo(pistonExt,   (float)EXT_PISTON_HOME_POS_M,   false);
+    bool hTipHome   = MoveHingeToAngle(hingeTip,   DegToRad(HINGE_TIP_HOME_DEG));
+    bool hMainHome  = MoveHingeToAngle(hingeMain, DegToRad(HINGE_MAIN_HOME_DEG));
+
+    if (rHome && pFinalHome && pThirdHome && pExtHome && hTipHome && hMainHome) {
+        FullStop();
+        ResetWheels();
+        currentMode = GlobalMode.None;
+        state = ArmState.Idle;
+    }
+}
+
+
+// ======================= BLOCK FINDING =======================
+
+void FindBlocks(bool fullScan = false) {
+
+    rotor       = GridTerminalSystem.GetBlockWithName(ROTOR_NAME)        as IMyMotorStator;    
+    pistonExt   = GridTerminalSystem.GetBlockWithName(PISTON_EXT_NAME)   as IMyPistonBase;
+    pistonThird = GridTerminalSystem.GetBlockWithName(PISTON_THIRD_NAME) as IMyPistonBase;
+    pistonFinal = GridTerminalSystem.GetBlockWithName(PISTON_FINAL_NAME) as IMyPistonBase;
+
+    hingeMain   = GridTerminalSystem.GetBlockWithName(HINGE_MAIN_NAME)   as IMyMotorStator;
+    hingeTip    = GridTerminalSystem.GetBlockWithName(HINGE_TIP_NAME)    as IMyMotorStator;
+
+    drill       = GridTerminalSystem.GetBlockWithName(DRILL_NAME)        as IMyShipDrill;
+
+    // Cargo
+    cargos.Clear();
+    if (!string.IsNullOrEmpty(CARGO_NAME)) {
+        var c = GridTerminalSystem.GetBlockWithName(CARGO_NAME) as IMyCargoContainer;
+        if (c != null) cargos.Add(c);
+    }
+    else {
+        GridTerminalSystem.GetBlocksOfType<IMyCargoContainer>(cargos, c => c.CubeGrid == Me.CubeGrid);
+    }
+
+    // Controller
+    List<IMyShipController> ctrls = new List<IMyShipController>();
+    GridTerminalSystem.GetBlocksOfType<IMyShipController>(ctrls, c => c.CubeGrid == Me.CubeGrid);
+
+    ctrl = null;
+    foreach (var c in ctrls) {
+        if (c.IsMainCockpit) {
+            ctrl = c;
+            break;
+        }
+    }
+    if (ctrl == null && ctrls.Count > 0)
+        ctrl = ctrls[0];
+
+    // Wheels
+    FindWheels();
+}
+
+bool EnsureBlocks() {
+    if (rotor == null  || pistonExt == null || pistonThird == null || pistonFinal == null ||
+        hingeMain == null || hingeTip == null || drill == null || ctrl == null) {
+
+        FindBlocks();
+    }
+
+    return (rotor != null && pistonExt != null && pistonThird != null && pistonFinal != null &&
+            hingeMain != null && hingeTip != null &&
+            drill != null && ctrl != null);
+}
+
+
+// ======================= ARM HELPERS =======================
+
+bool MoveHingeToAngle(IMyMotorStator hinge, float targetRad)
+{
+    if (hinge == null) return true;
+
+    float diff = targetRad - hinge.Angle;
+
+    if (Math.Abs(diff) < DegToRad(ANGLE_TOL_DEG))
+    {
+        hinge.TargetVelocityRPM = 0f;
+        return true;
+    }
+
+    float rpm = IsTestMode() ? 2.0f : 0.5f;
+    hinge.TargetVelocityRPM = diff > 0 ? rpm : -rpm;
+
+    return false;
+}
+
+bool MoveRotorToAngle(IMyMotorStator rotor, float targetRad, float rpm)
+{
+    if (rotor == null) return true;
+
+    float diff = targetRad - rotor.Angle;
+
+    if (Math.Abs(diff) < DegToRad(ANGLE_TOL_DEG))
+    {
+        rotor.TargetVelocityRPM = 0f;
+        return true;
+    }
+
+    rotor.TargetVelocityRPM = diff > 0 ? rpm : -rpm;
+    return false;
+}
+
+bool MoveRotorToAngle(IMyMotorStator rotor, float targetRad)
+{
+    return MoveRotorToAngle(rotor, targetRad, IsTestMode() ? 2.0f : 0.5f);
+}
+
+bool MovePistonTo(IMyPistonBase piston, float target, bool fast)
+{
+    if (piston == null) return true;
+
+    float cur = piston.CurrentPosition;
+    float diff = target - cur;
+    float adiff = Math.Abs(diff);
+
+    if (adiff < POS_TOL_M)
+    {
+        piston.Velocity = 0f;
+        return true;
+    }
+
+    float baseSpeed = IsTestMode() ? 2.0f : (fast ? 1.5f : 0.5f);
+    float speed = baseSpeed;
+
+    if (adiff < 0.2f) speed = 0.2f;
+    if (adiff < 0.05f) speed = 0.05f;
+
+    float vel = diff > 0 ? speed : -speed;
+    piston.Velocity = vel;
+
+    return false;
+}
+
+
+// ======================= FULLNESS HELPERS =======================
+
+double GetTotalCargoFullness() {
+    if (cargos == null || cargos.Count == 0) return 0.0;
+
+    double cur = 0, max = 0;
+
+    foreach (var c in cargos) {
+        var inv = c.GetInventory();
+        cur += (double)inv.CurrentVolume;
+        max += (double)inv.MaxVolume;
+    }
+
+    if (max <= 0) return 0.0;
+    return cur / max;
+}
+
+double GetDrillFullness() {
+    if (drill == null) return 0.0;
+
+    var inv = drill.GetInventory();
+    double cur = (double)inv.CurrentVolume;
+    double max = (double)inv.MaxVolume;
+
+    if (max <= 0) return 0.0;
+    return cur / max;
+}
+
+double GetTotalFullness() {
+    return GetTotalCargoFullness() + GetDrillFullness();
+}
+
+
+// ======================= MATH HELPERS =======================
+
+float DegToRad(float deg) => MathHelper.ToRadians(deg);
+float RadToDeg(float rad) => MathHelper.ToDegrees(rad);
+
+
+// ======================= STATUS DISPLAY =======================
+
+void UpdateStatus(double dt) {
+
+    Echo(debug);
+    debug = "";
+    lastStatusTime += dt;
+    if (lastStatusTime < STATUS_INTERVAL_S) return;
+    lastStatusTime = 0;
+
+    var sb = new System.Text.StringBuilder();
+
+    sb.AppendLine("== Rover Auto Excavation (Rewrite) ==");
+
+    // Abort / error status at the very top
+    if (!string.IsNullOrEmpty(lastAbortReason))
+        sb.AppendLine("ABORT: " + lastAbortReason);
+    else
+        sb.AppendLine("ABORT: (none)");
+
+    sb.AppendLine($"Mode            : {currentMode}");
+    sb.AppendLine($"State           : {state}");
+    sb.AppendLine($"STOP            : {(stopRequested ? "YES" : "NO")}");
+    sb.AppendLine($"Drill           : {(drill?.Enabled ?? false ? "ON" : "OFF")}");
+
+    if (rotor != null)      sb.AppendLine($"Rotor Angle     : {RadToDeg(rotor.Angle):F1} deg");
+    if (hingeMain != null)  sb.AppendLine($"Hinge Main      : {RadToDeg(hingeMain.Angle):F1} deg");
+    if (hingeTip != null)   sb.AppendLine($"Hinge Tip       : {RadToDeg(hingeTip.Angle):F1} deg");
+    
+    if (pistonExt != null)    sb.AppendLine($"Piston Upper    : {pistonExt.CurrentPosition:F2} m");
+    if (pistonThird != null)  sb.AppendLine($"Piston Third    : {pistonThird.CurrentPosition:F2} m");
+    if (pistonFinal != null)  sb.AppendLine($"Piston Final    : {pistonFinal.CurrentPosition:F2} m");
+
+    if (ctrl != null) {
+        var massInfo = ctrl.CalculateShipMass();
+        sb.AppendLine($"Speed           : {ctrl.GetShipSpeed():F1} m/s");
+        sb.AppendLine($"Mass (phys)     : {massInfo.PhysicalMass:F0} kg");
+        sb.AppendLine($"Gravity         : {ctrl.GetNaturalGravity().Length():F2} m/s^2");
+    }
+
+    double fullness = GetTotalFullness();
+    sb.AppendLine($"Cargo+DrillFull : {(fullness * 100):F1}%");
+
+    sb.AppendLine($"Wheels          : {wheels.Count}");
+
+    lcd.WriteText(sb.ToString(), false);
+}
+
+
+// ======================= PARSE MANUAL MOVE =======================
+
+void ParseManualMoveCommand(string arg) {
+    var parts = arg.Split(' ');
+    if (parts.Length < 7) return;
+
+    float mainDeg, tipDeg, rotorDeg;
+    float pExt, pThird, pFinal;
+
+    if (!float.TryParse(parts[1], out mainDeg)) mainDeg = 0f;
+    if (!float.TryParse(parts[2], out tipDeg))  tipDeg  = 0f;
+    if (!float.TryParse(parts[3], out rotorDeg)) rotorDeg = 0f;
+
+    if (!float.TryParse(parts[4], out pExt))   pExt   = 0f;
+    if (!float.TryParse(parts[5], out pThird)) pThird = 0f;
+    if (!float.TryParse(parts[6], out pFinal)) pFinal = 0f;
+
+    manualMainRad  = DegToRad(mainDeg);
+    manualTipRad   = DegToRad(tipDeg);
+    manualRotorRad = DegToRad(rotorDeg);
+
+    manualPExt     = pExt;
+    manualPThird   = pThird;
+    manualPFinal   = pFinal;
+}
+
+
+// ======================= UNIT TEST POSES (TEST MODE) =======================
+
+void AdvanceTestPose() {
+    switch (testPose) {
+
+        case TestPose.VerticalHome:
+            lcd.WriteText("Pose 1: VerticalHome\nChecks: rotor=0, hinges straight, pistons retracted.");
+            RunMove(-90, 0, 0, 0, 0, 0);
+            testPose = TestPose.RotorLeft;
+            break;
+
+        case TestPose.RotorLeft:
+            lcd.WriteText("Pose 2: RotorLeft\nChecks: rotor left sweep symmetry.");
+            RunMove(-90, 0, 60, 0, 0, 0);
+            testPose = TestPose.RotorRight;
+            break;
+
+        case TestPose.RotorRight:
+            lcd.WriteText("Pose 3: RotorRight\nChecks: rotor right sweep symmetry.");
+            RunMove(-90, 0, 120, 0, 0, 0);
+            testPose = TestPose.Folded;
+            break;
+
+        case TestPose.Folded:
+            lcd.WriteText("Pose 4: Folded\nChecks: hinge folding geometry.");
+            RunMove(-90, 90, 0, 0, 0, 0);
+            testPose = TestPose.ExtendedForward;
+            break;
+
+        case TestPose.ExtendedForward:
+            lcd.WriteText("Pose 5: ExtendedForward\nChecks: arm straight forward alignment.");
+            RunMove(0, 0, 0, 0, 0, 0);
+            testPose = TestPose.PistonExt;
+            break;
+
+        case TestPose.PistonExt:
+            lcd.WriteText("Pose 6: PistonExt\nChecks: upper piston extends straight.");
+            RunMove(-90, 0, 0, 2, 0, 0);
+            testPose = TestPose.PistonThird;
+            break;
+
+        case TestPose.PistonThird:
+            lcd.WriteText("Pose 7: PistonThird\nChecks: third piston extends straight.");
+            RunMove(-90, 0, 0, 0, 2, 0);
+            testPose = TestPose.PistonFinal;
+            break;
+
+        case TestPose.PistonFinal:
+            lcd.WriteText("Pose 8: PistonFinal\nChecks: final piston extends straight.");
+            RunMove(-90, 0, 0, 0, 0, 2);
+            testPose = TestPose.FullExtension;
+            break;
+
+        case TestPose.FullExtension:
+            lcd.WriteText("Pose 9: FullExtension\nChecks: entire chain straight, no twist.");
+            RunMove(-90, 0, 0, 2, 2, 2);
+            testPose = TestPose.Done;
+            break;
+
+        case TestPose.Done:
+            lcd.WriteText("Unit Test Complete.\nAll poses executed.");
+            testPose = TestPose.None;
+            break;
+    }
+}
+
+void RunMove(float mainDeg, float tipDeg, float rotorDeg, float pExt, float pThird, float pFinal) {
+    manualMainRad  = DegToRad(mainDeg);
+    manualTipRad   = DegToRad(tipDeg);
+    manualRotorRad = DegToRad(rotorDeg);
+
+    manualPExt     = pExt;
+    manualPThird   = pThird;
+    manualPFinal   = pFinal;
+
+    state = ArmState.ManualMove;
+}
