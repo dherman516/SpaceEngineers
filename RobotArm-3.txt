@@ -346,14 +346,8 @@ public void Main(string argument, UpdateType updateSource)
 
     double dt = Runtime.TimeSinceLastRun.TotalSeconds;
     if (dt <= 0) dt = 0.016;
-
-    if (state != ArmState.Idle)
-    {
-        TRACE("Safety checks");
-        CheckSafeZone();
-        if (COLLISION_ENVELOPE)
-            CheckCollisionEnvelope();
-    }
+//----------------- consolidated health check -----------------
+if (state != ArmState.Idle) { TRACE("Safety checks"); CheckSafeZone(); if (COLLISION_ENVELOPE) CheckCollisionEnvelope(); CheckArmIntegrity(); 
 
     if (state != ArmState.Idle)
     {
@@ -1338,4 +1332,85 @@ bool EnsureBlocks()
 
     return (rotor != null && pistonExt != null && pistonThird != null && pistonFinal != null &&
             hingeMain != null && hingeTip != null && drill != null && ctrl != null);
+}
+// ======================= ARM HEALTH CHECKERS =======================
+
+bool IsPistonHeadHealthy(IMyPistonBase piston, string expectedDrillName = null)
+{
+    if (piston == null)
+        return false;
+
+    // Check piston head exists
+    var head = piston.Top;
+    if (head == null)
+        return false;
+
+    // If verifying drill attachment
+    if (!string.IsNullOrEmpty(expectedDrillName))
+    {
+        var drills = new List<IMyShipDrill>();
+        GridTerminalSystem.GetBlocksOfType(drills, d => d.CubeGrid == head.CubeGrid);
+
+        foreach (var d in drills)
+        {
+            if (d.CustomName.Contains(expectedDrillName))
+                return true;
+        }
+
+        return false;
+    }
+
+    return true;
+}
+
+bool IsBlockOnSameGrid(IMyTerminalBlock a, IMyTerminalBlock b)
+{
+    if (a == null || b == null)
+        return false;
+
+    return a.CubeGrid == b.CubeGrid;
+}
+
+bool IsDrillHealthy()
+{
+    if (drill == null)
+        return false;
+
+    // Drill must have an inventory and be functional
+    var inv = drill.GetInventory();
+    if (inv == null)
+        return false;
+
+    return drill.IsFunctional;
+}
+
+void CheckArmIntegrity()
+{
+    // Final piston must have the drill attached
+    if (!IsPistonHeadHealthy(pistonFinal, DRILL_NAME))
+    {
+        Abort("Damage detected: Final piston head or drill missing/detached");
+        return;
+    }
+
+    // Third piston head
+    if (!IsPistonHeadHealthy(pistonThird))
+    {
+        Abort("Damage detected: Third piston head missing/detached");
+        return;
+    }
+
+    // Upper piston head
+    if (!IsPistonHeadHealthy(pistonExt))
+    {
+        Abort("Damage detected: Upper piston head missing/detached");
+        return;
+    }
+
+    // Drill must be functional
+    if (!IsDrillHealthy())
+    {
+        Abort("Damage detected: Drill block missing or non-functional");
+        return;
+    }
 }
