@@ -210,6 +210,97 @@ void RestoreDrive()
         ctrl.HandBrake = false;
 }
 
+void ResetEntireGrid()
+{
+    var blocks = new List<IMyTerminalBlock>();
+    GridTerminalSystem.GetBlocks(blocks);
+
+    foreach (var b in blocks)
+    {
+        // Wheels
+        var wheel = b as IMyMotorSuspension;
+        if (wheel != null)
+        {
+            wheel.Brake = false;
+            wheel.PropulsionOverride = 0f;
+            wheel.SteeringOverride = 0f;
+            wheel.Power = 1f;
+            wheel.Friction = 1f;
+            wheel.Strength = 50f;
+            wheel.Height = 0f;
+            continue;
+        }
+
+        // Gyros
+        var gyro = b as IMyGyro;
+        if (gyro != null)
+        {
+            gyro.GyroOverride = false;
+            gyro.Yaw = gyro.Pitch = gyro.Roll = 0f;
+            gyro.GyroPower = 3f;   // your chosen value
+            continue;
+        }
+
+        // Thrusters
+        var thr = b as IMyThrust;
+        if (thr != null)
+        {
+            thr.ThrustOverride = 0f;
+            thr.ThrustOverridePercentage = 0f;
+            continue;
+        }
+
+        // Cockpits / RC blocks
+        var ctrl = b as IMyShipController;
+        if (ctrl != null)
+        {
+            ctrl.HandBrake = false;
+            ctrl.DampenersOverride = true;
+            ctrl.ControlThrusters = false;
+            ctrl.ControlWheels = true;
+            continue;
+        }
+
+        // Rotors / Hinges
+        var rotor = b as IMyMotorStator;
+        if (rotor != null)
+        {
+            rotor.TargetVelocityRPM = 0f;
+            rotor.RotorLock = false;
+            continue;
+        }
+
+        // Pistons
+        var piston = b as IMyPistonBase;
+        if (piston != null)
+        {
+            piston.Velocity = 0f;
+            continue;
+        }
+
+        // Connectors
+        var conn = b as IMyShipConnector;
+        if (conn != null)
+        {
+            if (conn.Status == MyShipConnectorStatus.Connected ||
+                conn.Status == MyShipConnectorStatus.Connectable)
+            {
+                conn.Disconnect();
+            }
+            continue;
+        }
+
+        // Merge blocks
+        var merge = b as IMyShipMergeBlock;
+        if (merge != null)
+        {
+            merge.Enabled = true;
+            continue;
+        }
+    }
+
+    Echo("Full grid reset complete.");
+}
 
 // ======================= PROGRAM START =======================
 
@@ -337,7 +428,10 @@ void HandleCommand(string arg) {
     TRACE("HandleCommand: " + arg);
     stopRequested = false;
     lastAbortReason = "";
-
+    if (arg == "resetgrid") { 
+         ResetEntireGrid();
+         return; 
+    }
     if (arg == "stop") {
         FullStop();
         ResetWheels();
