@@ -1,0 +1,70 @@
+// Space Engineers Inventory Sorter
+// Author: Copilot
+
+// === CONFIGURATION ===
+// Name your containers like this:
+const string ORE_CONTAINER = "Ore Storage";
+const string INGOT_CONTAINER = "Ingot Storage";
+const string COMPONENT_CONTAINER = "Component Storage";
+const string TOOL_CONTAINER = "Tool Storage";
+const string AMMO_CONTAINER = "Ammo Storage";
+const string MISC_CONTAINER = "Misc Storage";
+
+List<IMyCargoContainer> allContainers = new List<IMyCargoContainer>();
+Dictionary<string, IMyCargoContainer> categoryTargets = new Dictionary<string, IMyCargoContainer>();
+
+public Program()
+{
+    Runtime.UpdateFrequency = UpdateFrequency.Update100;
+
+    // Cache containers
+    GridTerminalSystem.GetBlocksOfType(allContainers);
+
+    // Map categories
+    categoryTargets["Ore"] = GetContainer(ORE_CONTAINER);
+    categoryTargets["Ingot"] = GetContainer(INGOT_CONTAINER);
+    categoryTargets["Component"] = GetContainer(COMPONENT_CONTAINER);
+    categoryTargets["Tool"] = GetContainer(TOOL_CONTAINER);
+    categoryTargets["Ammo"] = GetContainer(AMMO_CONTAINER);
+    categoryTargets["Misc"] = GetContainer(MISC_CONTAINER);
+}
+
+IMyCargoContainer GetContainer(string name)
+{
+    return allContainers.FirstOrDefault(c => c.CustomName.Contains(name));
+}
+
+public void Main(string argument, UpdateType updateSource)
+{
+    foreach (var container in allContainers)
+    {
+        var inv = container.GetInventory();
+        var items = new List<MyInventoryItem>();
+        inv.GetItems(items);
+
+        foreach (var item in items)
+        {
+            string type = GetCategory(item);
+
+            if (categoryTargets.ContainsKey(type) && categoryTargets[type] != null)
+            {
+                var targetInv = categoryTargets[type].GetInventory();
+                inv.TransferItemTo(targetInv, item);
+            }
+        }
+    }
+}
+
+string GetCategory(MyInventoryItem item)
+{
+    string typeId = item.Type.TypeId;
+    string subtype = item.Type.SubtypeId;
+
+    if (typeId.Contains("Ore")) return "Ore";
+    if (typeId.Contains("Ingot")) return "Ingot";
+    if (typeId.Contains("Component")) return "Component";
+    if (typeId.Contains("Ammo")) return "Ammo";
+    if (typeId.Contains("Tool") || typeId.Contains("Gun")) return "Tool";
+
+    return "Misc";
+}
