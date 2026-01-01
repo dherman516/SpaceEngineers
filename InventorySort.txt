@@ -1,70 +1,153 @@
-// Space Engineers Inventory Sorter
-// Author: Copilot
+// Space Engineers Inventory Manager (Legacy C# Compatible)
+// Author: Copilot (customized for Dave)
 
-// === CONFIGURATION ===
-// Name your containers like this:
-const string ORE_CONTAINER = "Ore Storage";
-const string INGOT_CONTAINER = "Ingot Storage";
-const string COMPONENT_CONTAINER = "Component Storage";
-const string TOOL_CONTAINER = "Tool Storage";
-const string AMMO_CONTAINER = "Ammo Storage";
-const string MISC_CONTAINER = "Misc Storage";
+List<IMyTerminalBlock> allBlocks = new List<IMyTerminalBlock>();
+List<IMyCargoContainer> cargo = new List<IMyCargoContainer>();
+List<IMyRefinery> refineries = new List<IMyRefinery>();
 
-List<IMyCargoContainer> allContainers = new List<IMyCargoContainer>();
-Dictionary<string, IMyCargoContainer> categoryTargets = new Dictionary<string, IMyCargoContainer>();
+int tickCounter = 0;
+ const int RUN_INTERVAL = 38; // ~60 seconds
 
 public Program()
 {
     Runtime.UpdateFrequency = UpdateFrequency.Update100;
-
-    // Cache containers
-    GridTerminalSystem.GetBlocksOfType(allContainers);
-
-    // Map categories
-    categoryTargets["Ore"] = GetContainer(ORE_CONTAINER);
-    categoryTargets["Ingot"] = GetContainer(INGOT_CONTAINER);
-    categoryTargets["Component"] = GetContainer(COMPONENT_CONTAINER);
-    categoryTargets["Tool"] = GetContainer(TOOL_CONTAINER);
-    categoryTargets["Ammo"] = GetContainer(AMMO_CONTAINER);
-    categoryTargets["Misc"] = GetContainer(MISC_CONTAINER);
 }
 
-IMyCargoContainer GetContainer(string name)
+public void Main(string arg, UpdateType updateSource)
 {
-    return allContainers.FirstOrDefault(c => c.CustomName.Contains(name));
-}
+   tickCounter++; 
+   if (tickCounter < RUN_INTERVAL)
+           return;
+    tickCounter = 0; // reset    
 
-public void Main(string argument, UpdateType updateSource)
-{
-    foreach (var container in allContainers)
+
+   GridTerminalSystem.GetBlocksOfType(allBlocks, SameGrid);
+
+    cargo.Clear();
+    refineries.Clear();
+
+    // Collect cargo containers and refineries
+    for (int i = 0; i < allBlocks.Count; i++)
     {
-        var inv = container.GetInventory();
-        var items = new List<MyInventoryItem>();
-        inv.GetItems(items);
+        var b = allBlocks[i];
 
-        foreach (var item in items)
+        var cargoBlock = b as IMyCargoContainer;
+        if (cargoBlock != null)
+            cargo.Add(cargoBlock);
+
+        var refineryBlock = b as IMyRefinery;
+        if (refineryBlock != null)
+            refineries.Add(refineryBlock);
+    }
+
+    // Sort cargo by largest capacity
+cargo.Sort((a, b) =>
+{
+    float aCap = (float)a.GetInventory().MaxVolume;
+    float bCap = (float)b.GetInventory().MaxVolume;
+    return bCap > aCap ? 1 : (bCap < aCap ? -1 : 0);
+});
+
+
+    // Process all inventories except refinery input
+    for (int i = 0; i < allBlocks.Count; i++)
+    {
+        var block = allBlocks[i];
+
+        // Skip refineries here (handled separately)
+        if (block is IMyRefinery)
+            continue;
+
+        int invCount = block.InventoryCount;
+        for (int invIndex = 0; invIndex < invCount; invIndex++)
         {
-            string type = GetCategory(item);
+            var inv = block.GetInventory(invIndex);
+            MoveItems(inv);
+        }
+    }
 
-            if (categoryTargets.ContainsKey(type) && categoryTargets[type] != null)
-            {
-                var targetInv = categoryTargets[type].GetInventory();
-                inv.TransferItemTo(targetInv, item);
-            }
+    // Process refinery inventories (only move non-mineables)
+    for (int i = 0; i < refineries.Count; i++)
+    {
+        var r = refineries[i];
+        var inv = r.GetInventory(0);
+        MoveNonMineables(inv);
+    }
+}
+
+bool SameGrid(IMyTerminalBlock b)
+{
+    return b.IsSameConstructAs(Me);
+}
+
+bool IsMineable(MyInventoryItem item)
+{
+    string type = item.Type.TypeId;
+    string sub = item.Type.SubtypeId;
+
+    // Ore except Ice
+    if (type.IndexOf("Ore") != -1 && sub != "Ice")
+        return true;
+
+    // Ingots
+    if (type.IndexOf("Ingot") != -1)
+        return true;
+
+    return false;
+}
+
+void MoveItems(IMyInventory from)
+{
+    var items = new List<MyInventoryItem>();
+    from.GetItems(items);
+
+    for (int i = 0; i < items.Count; i++)
+    {
+        var item = items[i];
+
+        if (IsMineable(item))
+        {
+            MoveToRefinery(from, item);
+        }
+        else
+        {
+            MoveToCargo(from, item);
         }
     }
 }
 
-string GetCategory(MyInventoryItem item)
+void MoveNonMineables(IMyInventory from)
 {
-    string typeId = item.Type.TypeId;
-    string subtype = item.Type.SubtypeId;
+    var items = new List<MyInventoryItem>();
+    from.GetItems(items);
 
-    if (typeId.Contains("Ore")) return "Ore";
-    if (typeId.Contains("Ingot")) return "Ingot";
-    if (typeId.Contains("Component")) return "Component";
-    if (typeId.Contains("Ammo")) return "Ammo";
-    if (typeId.Contains("Tool") || typeId.Contains("Gun")) return "Tool";
+    for (int i = 0; i < items.Count; i++)
+    {
+        var item = items[i];
 
-    return "Misc";
+        if (!IsMineable(item))
+        {
+            MoveToCargo(from, item);
+        }
+    }
+}
+
+void MoveToRefinery(IMyInventory from, MyInventoryItem item)
+{
+    for (int i = 0; i < refineries.Count; i++)
+    {
+        var inv = refineries[i].GetInventory(0);
+        if (from.TransferItemTo(inv, item))
+            return;
+    }
+}
+
+void MoveToCargo(IMyInventory from, MyInventoryItem item)
+{
+    for (int i = 0; i < cargo.Count; i++)
+    {
+        var inv = cargo[i].GetInventory();
+        if (from.TransferItemTo(inv, item))
+            return;
+    }
 }
