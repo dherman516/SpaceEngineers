@@ -1,12 +1,19 @@
-// Space Engineers Inventory Manager (Legacy C# Compatible)
-// Author: Copilot (customized for Dave)
+// Space Engineers Inventory Manager (Smart Assembler Queues)
+// Assemblers auto-assigned different components for parallel production
 
 List<IMyTerminalBlock> allBlocks = new List<IMyTerminalBlock>();
 List<IMyCargoContainer> cargo = new List<IMyCargoContainer>();
+List<IMyCargoContainer> queueContainers = new List<IMyCargoContainer>();
 List<IMyRefinery> refineries = new List<IMyRefinery>();
+List<IMyCockpit> cockpits = new List<IMyCockpit>();
+List<IMyAssembler> assemblers = new List<IMyAssembler>();
+Dictionary<string, float> componentQuotas = new Dictionary<string, float>();
+List<string> neededComponents = new List<string>();
 
 int tickCounter = 0;
- const int RUN_INTERVAL = 38; // ~60 seconds
+const int RUN_INTERVAL = 38;
+const float QUEUE_TARGET = 500f;
+const int QUEUE_BATCH = 1000; // Queue 1000 per assembler run
 
 public Program()
 {
@@ -15,139 +22,256 @@ public Program()
 
 public void Main(string arg, UpdateType updateSource)
 {
-   tickCounter++; 
-   if (tickCounter < RUN_INTERVAL)
-           return;
-    tickCounter = 0; // reset    
+    tickCounter++; 
+    if (tickCounter < RUN_INTERVAL) return;
+    tickCounter = 0;   
 
+    GridTerminalSystem.GetBlocksOfType(allBlocks, SameGrid);
+    
+    // Clear collections
+    cargo.Clear(); queueContainers.Clear(); refineries.Clear(); 
+    cockpits.Clear(); assemblers.Clear(); componentQuotas.Clear();
+    neededComponents.Clear();
 
-   GridTerminalSystem.GetBlocksOfType(allBlocks, SameGrid);
+    // Collect blocks
+    CollectBlocks();
+    
+    // Sort cargo
+    cargo.Sort((a, b) => {
+        float aCap = (float)a.GetInventory().MaxVolume;
+        float bCap = (float)b.GetInventory().MaxVolume;
+        return bCap > aCap ? 1 : (bCap < aCap ? -1 : 0);
+    });
 
-    cargo.Clear();
-    refineries.Clear();
+    // MANAGE ASSEMBLER QUEUES FIRST (Smart distribution)
+    ManageAssemblerQueues();
+    
+    // Process inventories
+    ProcessConnectors();
+    ProcessAssemblers();  // Clear assembler outputs
+    ProcessOtherBlocks();
+    ProcessRefineries();
+}
 
-    // Collect cargo containers and refineries
-    for (int i = 0; i < allBlocks.Count; i++)
-    {
-        var b = allBlocks[i];
-
-        var cargoBlock = b as IMyCargoContainer;
-        if (cargoBlock != null)
-            cargo.Add(cargoBlock);
-
-        var refineryBlock = b as IMyRefinery;
-        if (refineryBlock != null)
-            refineries.Add(refineryBlock);
-    }
-
-    // Sort cargo by largest capacity
-cargo.Sort((a, b) =>
+void CollectBlocks()
 {
-    float aCap = (float)a.GetInventory().MaxVolume;
-    float bCap = (float)b.GetInventory().MaxVolume;
-    return bCap > aCap ? 1 : (bCap < aCap ? -1 : 0);
-});
-
-
-    // Process all inventories except refinery input
-    for (int i = 0; i < allBlocks.Count; i++)
+    foreach (var b in allBlocks)
     {
-        var block = allBlocks[i];
-
-        // Skip refineries here (handled separately)
-        if (block is IMyRefinery)
-            continue;
-
-        int invCount = block.InventoryCount;
-        for (int invIndex = 0; invIndex < invCount; invIndex++)
+        if (b is IMyCargoContainer cargoBlock)
         {
-            var inv = block.GetInventory(invIndex);
-            MoveItems(inv);
+            string customData = cargoBlock.CustomData.ToLower();
+            if (customData.Contains("component:"))
+            {
+                ParseQuotas(customData, cargoBlock);
+                queueContainers.Add(cargoBlock);
+            }
+            else cargo.Add(cargoBlock);
+        }
+        else if (b is IMyRefinery) refineries.Add(b as IMyRefinery);
+        else if (b is IMyCockpit) cockpits.Add(b as IMyCockpit);
+        else if (b is IMyAssembler) assemblers.Add(b as IMyAssembler);
+    }
+}
+
+void ManageAssemblerQueues()
+{
+    // Find what components need production
+    AnalyzeComponentNeeds();
+    
+    // Assign different components to each assembler
+    for (int i = 0; i < assemblers.Count && neededComponents.Count > 0; i++)
+    {
+        var assembler = assemblers[i];
+        
+        // Skip if assembler is busy or full
+        if (assembler.IsQueueEmpty || assembler.InventoryCount == 0)
+        {
+            // Pick next needed component (rotate to balance)
+            string component = neededComponents[i % neededComponents.Count];
+            QueueComponent(assembler, component, QUEUE_BATCH);
         }
     }
+}
 
-    // Process refinery inventories (only move non-mineables)
-    for (int i = 0; i < refineries.Count; i++)
+void AnalyzeComponentNeeds()
+{
+    foreach (var container in queueContainers)
     {
-        var r = refineries[i];
-        var inv = r.GetInventory(0);
-        MoveNonMineables(inv);
+        var inv = container.GetInventory();
+        foreach (var quotaKvp in componentQuotas)
+        {
+            string componentId = quotaKvp.Key;
+            float target = quotaKvp.Value;
+            
+            float current = GetItemCount(inv, componentId);
+            if (current < target * 0.8f) // Below 80% = needs production
+            {
+                if (!neededComponents.Contains(componentId))
+                    neededComponents.Add(componentId);
+            }
+        }
     }
 }
 
-bool SameGrid(IMyTerminalBlock b)
+void QueueComponent(IMyAssembler assembler, string componentSubtype, int amount)
 {
-    return b.IsSameConstructAs(Me);
+    // Clear existing queue first
+    assembler.ClearQueue();
+    
+    // Add component to queue
+    var itemType = new MyDefinitionId(typeof(MyObjectBuilder_Component), componentSubtype);
+    assembler.AddQueueItem(itemType, amount);
+    
+    // Start assembler
+    assembler.Enabled = true;
 }
 
+bool SameGrid(IMyTerminalBlock b) => b.IsSameConstructAs(Me);
+
+void ParseQuotas(string customData, IMyCargoContainer container)
+{
+    string[] lines = customData.Split('\n');
+    foreach (string line in lines)
+    {
+        if (line.Contains("component:"))
+        {
+            string[] parts = line.Split(':');
+            if (parts.Length >= 2)
+            {
+                string componentType = parts[0].Replace("component:", "").Trim().ToLower();
+                if (float.TryParse(parts[1].Trim(), out float quota))
+                    componentQuotas[componentType] = quota;
+            }
+        }
+    }
+}
+
+// Item classification (unchanged)
 bool IsMineable(MyInventoryItem item)
 {
-    string type = item.Type.TypeId;
-    string sub = item.Type.SubtypeId;
+    string type = item.Type.TypeId, sub = item.Type.SubtypeId;
+    return (type.IndexOf("Ore") != -1 && sub != "Ice") || type.IndexOf("Ingot") != -1;
+}
 
-    // Ore except Ice
-    if (type.IndexOf("Ore") != -1 && sub != "Ice")
-        return true;
+bool IsFood(MyInventoryItem item)
+{
+    string sub = item.Type.SubtypeId.ToLower();
+    return sub.Contains("canned") || sub.Contains("medical") || 
+           sub.Contains("nitrogen") || sub.Contains("hydrogen") || sub.Contains("oxygen");
+}
 
-    // Ingots
-    if (type.IndexOf("Ingot") != -1)
-        return true;
+bool IsComponent(MyInventoryItem item) => item.Type.TypeId.ToLower().Contains("component");
 
-    return false;
+float GetItemCount(IMyInventory inv, string subtypeId)
+{
+    var items = new List<MyInventoryItem>();
+    inv.GetItems(items);
+    float total = 0;
+    foreach (var item in items)
+        if (item.Type.SubtypeId.ToLower() == subtypeId) total += (float)item.Amount;
+    return total;
+}
+
+// Processing methods (unchanged from previous version)
+void ProcessConnectors()
+{
+    List<IMyShipConnector> connectors = new List<IMyShipConnector>();
+    GridTerminalSystem.GetBlocksOfType(connectors, SameGrid);
+    foreach (var c in connectors)
+        if (c.Status == MyShipConnectorStatus.Connected) ProcessInventory(c);
+}
+
+void ProcessAssemblers()
+{
+    foreach (var a in assemblers) ProcessInventory(a);
+}
+
+void ProcessOtherBlocks()
+{
+    foreach (var block in allBlocks)
+        if (block is not (IMyRefinery or IMyCockpit or IMyAssembler or IMyShipConnector))
+            ProcessInventory(block);
+}
+
+void ProcessRefineries()
+{
+    foreach (var r in refineries)
+        MoveNonMineables(r.GetInventory(0));
+}
+
+void ProcessInventory(IMyTerminalBlock block)
+{
+    for (int i = 0; i < block.InventoryCount; i++)
+        MoveItems(block.GetInventory(i));
 }
 
 void MoveItems(IMyInventory from)
 {
     var items = new List<MyInventoryItem>();
     from.GetItems(items);
-
-    for (int i = 0; i < items.Count; i++)
+    foreach (var item in items)
     {
-        var item = items[i];
+        if (IsFood(item)) DistributeFood(from, item);
+        else if (IsMineable(item)) MoveToRefinery(from, item);
+        else if (IsComponent(item)) MoveToComponentQueue(from, item);
+        else MoveToCargo(from, item);
+    }
+}
 
-        if (IsMineable(item))
+void DistributeFood(IMyInventory from, MyInventoryItem item)
+{
+    if (cockpits.Count == 0) { MoveToCargo(from, item); return; }
+    
+    float perCockpit = item.Amount / cockpits.Count;
+    foreach (var cockpit in cockpits)
+    {
+        var inv = cockpit.GetInventory();
+        if (inv.CurrentVolume < inv.MaxVolume)
         {
-            MoveToRefinery(from, item);
-        }
-        else
-        {
-            MoveToCargo(from, item);
+            float target = Math.Min(perCockpit, (float)inv.MaxVolume - (float)inv.CurrentVolume);
+            if (target > 0 && from.TransferItemTo(inv, item, target)) return;
         }
     }
+    MoveToCargo(from, item);
+}
+
+void MoveToComponentQueue(IMyInventory from, MyInventoryItem item)
+{
+    string itemId = item.Type.SubtypeId.ToLower();
+    foreach (var container in queueContainers)
+    {
+        var inv = container.GetInventory();
+        if (componentQuotas.ContainsKey(itemId) && inv.CurrentVolume < inv.MaxVolume)
+        {
+            float current = GetItemCount(inv, itemId);
+            if (current < componentQuotas[itemId])
+                if (from.TransferItemTo(inv, item)) return;
+        }
+    }
+    MoveToCargo(from, item);
 }
 
 void MoveNonMineables(IMyInventory from)
 {
     var items = new List<MyInventoryItem>();
     from.GetItems(items);
-
-    for (int i = 0; i < items.Count; i++)
-    {
-        var item = items[i];
-
+    foreach (var item in items)
         if (!IsMineable(item))
         {
-            MoveToCargo(from, item);
+            if (IsFood(item)) DistributeFood(from, item);
+            else if (IsComponent(item)) MoveToComponentQueue(from, item);
+            else MoveToCargo(from, item);
         }
-    }
 }
 
 void MoveToRefinery(IMyInventory from, MyInventoryItem item)
 {
-    for (int i = 0; i < refineries.Count; i++)
-    {
-        var inv = refineries[i].GetInventory(0);
-        if (from.TransferItemTo(inv, item))
-            return;
-    }
+    foreach (var r in refineries)
+        if (from.TransferItemTo(r.GetInventory(0), item)) return;
 }
 
 void MoveToCargo(IMyInventory from, MyInventoryItem item)
 {
-    for (int i = 0; i < cargo.Count; i++)
-    {
-        var inv = cargo[i].GetInventory();
-        if (from.TransferItemTo(inv, item))
-            return;
-    }
+    foreach (var c in cargo)
+        if (from.TransferItemTo(c.GetInventory(), item)) return;
 }
