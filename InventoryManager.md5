@@ -1,0 +1,119 @@
+# Space Engineers Inventory Manager README
+
+## Overview
+Advanced inventory management script for Space Engineers that automates sorting, queueing, and production across your entire grid. Handles connectors, assemblers, refineries, cockpits, and smart component queues.
+
+## Features
+
+### **Core Sorting**
+- **Ore** (except Ice) → Refinery inputs
+- **Ingots** → Refinery inputs  
+- **Components** → Smart queue containers (500 quota target)
+- **Food/Medical/Bottles** → Evenly distributed to cockpits
+- **Everything else** → General cargo (largest capacity first)
+
+### **Smart Production**
+- **Assembler Queue Management**: Each assembler produces different components automatically
+- **Queue Monitoring**: Tracks component needs across all queue containers
+- **Parallel Production**: No two assemblers duplicate work
+
+### **Priority Processing**
+```
+1. Connectors → Unload docked ships FIRST
+2. Assemblers → Keep clean for continuous production  
+3. Other blocks → Normal sorting
+4. Refineries → Cleanup non-mineables
+```
+
+## Setup Instructions
+
+### **1. Component Queue Containers**
+Label **dedicated cargo containers** with Custom Data:
+```
+SteelPlate:500
+Construction:500  
+Motor:500
+Computer:500
+```
+- **Multiple lines** = multiple quotas per container
+- **500** = target item count
+- **Excess** automatically goes to general cargo
+
+### **2. General Cargo**
+- **No Custom Data** = overflow storage
+- **Automatically sorted** by largest capacity first
+
+### **3. Deployment**
+```
+1. Copy script to Programmable Block
+2. Set UpdateFrequency = Update100
+3. Run "Main" argument
+4. Script runs every ~60 seconds
+```
+
+## Processing Flow
+```
+Connectors (docked) 
+   ↓
+Assemblers (outputs)  
+   ↓
+All other inventories
+   ↓  
+Refineries (cleanup)
+```
+
+**Food → Cockpits first** (equal distribution)
+**Components → Queues** (fill to quota)
+**Ore/Ingots → Refineries**
+
+## Customization
+
+```
+RUN_INTERVAL = 38     // ~60 seconds (adjust 20-50)
+QUEUE_TARGET = 500f   // Queue container target
+QUEUE_BATCH = 1000    // Assembler queue amount
+```
+
+## Block Requirements
+```
+✅ Cargo Containers (general + queue)
+✅ Refineries  
+✅ Assemblers
+✅ Cockpits (food)
+✅ Connectors (docked ships)
+```
+
+## Troubleshooting
+```
+❌ Assemblers not producing?
+→ Check ingot supply to assemblers
+→ Verify queue container Custom Data format
+
+❌ Components not queueing?
+→ Custom Data must be: "SteelPlate:500" (case insensitive)
+→ Component name must match exactly
+
+❌ Food not distributing?
+→ Cockpits must have inventory space
+```
+
+## Performance
+- **Update100** (10Hz) with 38-tick interval = ~60s cycles
+- **SameGrid only** - no cross-grid scanning
+- **Optimized sorting** - largest cargo first
+- **Batch processing** - minimal inventory scans
+
+## Change Log
+```
+v1.0 - Original ore/ingot sorting
+v1.1 - Component queueing (500 target)  
+v1.2 - Connector collection
+v1.3 - Cockpit food distribution
+v1.4 - Assembler cleanup
+v1.5 - Smart assembler queue management
+```
+
+**Copy this entire file as `README.md` next to your Programmable Block!** Perfect documentation for multi-crew bases/ships.[1][2]
+
+[1](https://steamcommunity.com/sharedfiles/filedetails/?id=1226261795)
+[2](https://forum.keenswh.com/threads/my-insane-inventory-sorting-script.7312888/)
