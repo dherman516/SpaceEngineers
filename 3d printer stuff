@@ -1,0 +1,123 @@
+// Projector Mover for X-Welder Wall Printer
+// Moves projector perpendicular across 5m cube via piston->rotor->head
+
+IMyPistonBase Piston;
+IMyMotorStator Rotor;
+IMyProjector Proj;
+
+float stepDist = 0.5f;  // Layer step (m)
+float totalDist = 5.0f; // Cube depth
+int currentStep = 0;
+bool running = false;
+
+public Program() {
+    Piston = GridTerminalSystem.GetBlockWithName("PistonHead") as IMyPistonBase;
+    Rotor = GridTerminalSystem.GetBlockWithName("RotorHead") as IMyMotorStator;
+    Proj = GridTerminalSystem.GetBlockWithName("ProjectorHead") as IMyProjector;
+    Runtime.UpdateFrequency = UpdateFrequency.Update100;
+    Echo("Printer ready. Arg: start/stop/home");
+}
+
+public void Main(string arg) {
+    if (arg == "start") { running = true; currentStep = 0; MoveNext(); }
+    else if (arg == "stop") { running = false; }
+    else if (arg == "home") { Home(); }
+    else if (arg.Contains("layer")) { int layer = int.Parse(arg.Split(' ')[1]); GoToLayer(layer); }
+    
+    Status();
+}
+
+void MoveNext() {
+    if (!running || currentStep * stepDist >= totalDist) { running = false; return; }
+    
+    GoToLayer(currentStep);
+    currentStep++;
+}
+
+void GoToLayer(int step) {
+    float pos = step * stepDist;
+    
+    // Extend piston perpendicular to wall (Y+ toward welders)
+    Piston.Velocity = 0.2f;
+    Piston.Position = pos;
+    
+    // Tilt rotor for angle if needed (e.g., 10deg down for underside)
+    Rotor.TargetVelocityRPM = 0;
+    Rotor.Angle = (float)(Math.PI * 0.03 * step);  // Slight tilt progression
+    
+    // Offset projector forward into X coverage
+    Proj.ForwardOffset = 1.0f;  // 1m toward center
+    Proj.KeepProjection = true;
+    
+    // Wait for welders to catch up
+    if (running) DelayAction(() => { if (running) MoveNext(); }, 5000);
+}
+
+void Home() {
+    Piston.Position = 0;
+    Rotor.Angle = 0;
+    Proj.ForwardOffset = 0;
+}
+
+void Status() {
+    Echo($"Step: {currentStep}, Pos: {Piston.Position}, Running: {running}");
+}
+
+void DelayAction(Action act, int ms) {
+    // Simplified timer via Update loop (full version uses lists/timers)
+    // In practice, chain with actual Timer blocks named TimerStep1->N
+}
+
+// Auto Blueprint Aligner for X-Welder Printer
+IMyProjector Proj;
+float bestFitness = 0;
+Vector3 bestOffset = Vector3.Zero;
+float bestAngle = 0;
+
+public Program() {
+    Proj = GridTerminalSystem.GetBlockWithName("ProjectorHead") as IMyProjector;
+    Echo("Aligner ready. Arg: align");
+}
+
+public void Main(string arg) {
+    if (arg == "align") AlignBlueprint();
+    Status();
+}
+
+void AlignBlueprint() {
+    Proj.KeepProjection = true;  // Keep for testing
+    
+    // Grid search: Test offsets in 0.5m steps, rotations in 5deg
+    for (float x = -2f; x <= 2f; x += 0.5f) {
+        for (float y = -2f; y <= 2f; y += 0.5f) {
+            for (float z = 0f; z <= 1f; z += 0.5f) {  // Forward bias for wall
+                TestOffset(new Vector3(x, y, z));
+            }
+        }
+    }
+    
+    // Apply best
+    Proj.Offset = bestOffset;
+    Proj.Angle = bestAngle;
+    Echo($"Best: Offset {bestOffset}, Fitness {bestFitness:F0}%");
+}
+
+float TestOffset(Vector3 offset) {
+    Proj.Offset = offset;
+    Proj.UpdateOnce();  // Refresh projection
+    
+    float fitness = 1f - (float)Proj.RemainingBlocks / Proj.BlockCount;
+    if (fitness > bestFitness) {
+        bestFitness = fitness;
+        bestOffset = offset;
+    }
+    return fitness;
+}
+
+void Status() {
+    Echo($"Blocks: {Proj.BlockCount}, Remaining: {Proj.RemainingBlocks}");
+}
+
+
+
+
